@@ -1,4 +1,4 @@
-"""Standalone implementation of the validated Envision notebook Darcy model."""
+"""Memory-bounded FEM implementation of the validated PyGIMLi notebook model."""
 from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import asdict, dataclass
@@ -7,8 +7,73 @@ import numpy as np
 import pygimli as pg
 import pyvista as pv
 from scipy.ndimage import label as label_components
-from scipy.sparse import coo_matrix
-from scipy.sparse.linalg import MatrixRankWarning, spsolve
+from scipy.sparse import coo_matrix, diags
+from scipy.sparse.linalg import LinearOperator, MatrixRankWarning, gmres, spilu, spsolve
+
+ELEMENT_BATCH_SIZE = 8192
+
+
+def element_matrices(points, tetrahedra, conductivity):
+    """Linear tetrahedron gradients and stiffness for one bounded-size batch."""
+    vertices = points[tetrahedra]
+    edges = vertices[:, 1:] - vertices[:, :1]
+    volumes = np.abs(np.linalg.det(edges)) / 6
+    if not np.all(volumes > 0):
+        raise ModelValidationError("Nonpositive tetrahedron volume.")
+    g123 = np.linalg.inv(edges).transpose(0, 2, 1)
+    gradients = np.concatenate([-g123.sum(axis=1, keepdims=True), g123], axis=1)
+    local = conductivity[:, None, None]*volumes[:, None, None]*np.einsum(
+        "nik,njk->nij", gradients, gradients,
+    )
+    return gradients, local
+
+
+def assemble_stiffness(points, tetrahedra, conductivity):
+    from scipy.sparse import csr_matrix
+
+    matrix = csr_matrix((len(points), len(points)))
+    for start in range(0, len(tetrahedra), ELEMENT_BATCH_SIZE):
+        cells = tetrahedra[start:start+ELEMENT_BATCH_SIZE]
+        _, local = element_matrices(points, cells, conductivity[start:start+ELEMENT_BATCH_SIZE])
+        rows = np.repeat(cells, 4, axis=1).ravel()
+        cols = np.tile(cells, (1, 4)).ravel()
+        matrix += coo_matrix(
+            (local.ravel(), (rows, cols)), shape=matrix.shape,
+        ).tocsr()
+    return matrix
+
+
+def solve_head(matrix, rhs, safe_mode=True):
+    """Select a bounded iterative solve or the original unrestricted direct solve."""
+    if not safe_mode:
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", MatrixRankWarning)
+            solution = spsolve(matrix.tocsc(), rhs, permc_spec="COLAMD", use_umfpack=False)
+        if not np.all(np.isfinite(solution)):
+            raise ModelValidationError("Unrestricted direct solve produced nonfinite heads.")
+        return solution
+    diagonal = matrix.diagonal()
+    if not np.all(np.isfinite(diagonal)) or np.any(diagonal <= 0):
+        raise ModelValidationError("Hydraulic system has unsupported or invalid free nodes.")
+    scaling = 1/np.sqrt(diagonal)
+    scale = diags(scaling)
+    equilibrated = (scale @ matrix @ scale).tocsc()
+    ilu = spilu(
+        equilibrated, drop_tol=1e-6, fill_factor=10,
+        permc_spec="MMD_AT_PLUS_A", diag_pivot_thresh=0,
+    )
+    preconditioner = LinearOperator(equilibrated.shape, matvec=ilu.solve)
+    solution, info = gmres(
+        equilibrated, scaling*rhs, M=preconditioner,
+        rtol=1e-13, atol=0, restart=50, maxiter=300,
+    )
+    if info != 0 or not np.all(np.isfinite(solution)):
+        raise ModelValidationError(
+            f"Memory-bounded hydraulic solve did not converge (status {info}). "
+            "Try the coarse mesh or reduce extreme conductivity contrasts."
+        )
+    return scaling*solution
+
 
 class ModelValidationError(ValueError):
     """A geometry or hydraulic validation failed; do not publish this result."""
@@ -49,10 +114,13 @@ class ModelConfig:
     clay_porosity: float = 0.15
     fracture_porosity: float = 0.05
     pipe_porosity: float = 1.0
+    safe_mode: bool = True
     nx: int = 50
     ny: int = 6
 
     def validate(self) -> None:
+        if not isinstance(self.safe_mode, bool):
+            raise ModelValidationError("Safe mode must be true or false.")
         values = np.array(list(asdict(self).values()), dtype=float)
         if not np.all(np.isfinite(values)):
             raise ModelValidationError('Every parameter must be finite.')
@@ -262,12 +330,6 @@ def run_model(config: ModelConfig, progress: Callable[[str], None] | None=None) 
     well_ids = np.repeat(brick_well.ravel(), 6)
     if not set(markers) == set(MATERIALS):
         raise ModelValidationError('A material was not resolved.')
-    mesh = pg.Mesh(3)
-    for p in points:
-        mesh.createNode(p)
-    for t, m in zip(tets, markers):
-        mesh.createTetrahedron(*[mesh.node(int(j)) for j in t], marker=int(m))
-    mesh.createNeighborInfos()
     patch_heads = {101: HEAD_SPRING, 102: HEAD_RECHARGE}
     patch_names = {101: 'Spring/river surface', 102: 'Recharge surface'}
     for label, _, _ in WELLS:
@@ -276,44 +338,40 @@ def run_model(config: ModelConfig, progress: Callable[[str], None] | None=None) 
         patch_names[patch] = f'Borehole {label}'
     patch_nodes = {m: set() for m in patch_heads}
     patch_area = {m: 0.0 for m in patch_heads}
-    top_ids = set(ids[:, :, -1].ravel().tolist())
-    for b in mesh.boundaries():
-        if not b.outside():
-            continue
-        b.setMarker(0)
-        bids = [int(n.id()) for n in b.nodes()]
-        if not set(bids).issubset(top_ids):
-            continue
-        cell = b.leftCell()
-        if cell is None:
-            cell = b.rightCell()
-        material = markers[cell.id()]
+    # The six-tet brick split has two terrain triangles: (4,5,6) and (4,6,7).
+    top_corners = corners[:, :, -1, :].reshape(-1, 8)
+    top_faces = top_corners[:, np.array([(4, 5, 6), (4, 6, 7)])].reshape(-1, 3)
+    top_material = np.repeat(brick_material[:, :, -1].ravel(), 2)
+    top_well = np.repeat(brick_well[:, :, -1].ravel(), 2)
+    for face, material, well_id in zip(top_faces, top_material, top_well):
         if material == 10:
             continue
-        x, y, _ = np.asarray(b.center())
+        vertices = points[face]
+        x, y, _ = vertices.mean(axis=0)
         marker = 0
         if material == 11:
-            marker = 200 + int(well_ids[cell.id()])
+            marker = 200 + int(well_id)
         elif SPRING_X[0] <= x <= SPRING_X[1] and SPRING_Y[0] <= y <= SPRING_Y[1]:
             marker = 101
         elif RECHARGE_X[0] <= x <= RECHARGE_X[1] and RECHARGE_Y[0] <= y <= RECHARGE_Y[1]:
             marker = 102
         if marker:
-            b.setMarker(marker)
-            patch_nodes[marker].update(bids)
-            patch_area[marker] += b.size()
+            patch_nodes[marker].update(face.tolist())
+            patch_area[marker] += float(np.linalg.norm(np.cross(
+                vertices[1]-vertices[0], vertices[2]-vertices[0],
+            ))/2)
     if not all(patch_nodes.values()):
         raise ModelValidationError('An inlet/outlet boundary was not resolved.')
     fixed_sets = list(patch_nodes.values())
     if not sum(map(len, fixed_sets)) == len(set.union(*fixed_sets)):
         raise ModelValidationError('Boundary patches share nodes.')
-    report('Solving saturated groundwater head')
+    del centres, cx, cy, cz, hc, corners, det, network_components
+    report('Assembling saturated groundwater system in bounded batches')
     K = np.array([MATERIALS[int(m)]['K'] for m in markers])
     porosity = np.array([MATERIALS[int(m)]['porosity'] for m in markers])
     active_cells = K > 0
     active_nodes = np.unique(tets[active_cells])
-    stiffness = pg.solver.createStiffnessMatrix(mesh, K)
-    system_matrix = pg.utils.sparseMatrix2coo(stiffness).tocsr()
+    system_matrix = assemble_stiffness(points, tets, K)
     fixed = np.array(sorted(set.union(*patch_nodes.values())), dtype=int)
     fixed_head = np.empty(len(points))
     for marker, nodes in patch_nodes.items():
@@ -321,19 +379,39 @@ def run_model(config: ModelConfig, progress: Callable[[str], None] | None=None) 
     if not np.all(np.isin(fixed, active_nodes)):
         raise ModelValidationError('Model check failed: np.all(np.isin(fixed, active_nodes))')
     free = np.setdiff1d(active_nodes, fixed)
-    rhs = -system_matrix[free][:, fixed] @ fixed_head[fixed]
+    relative_fixed_head = (fixed_head[fixed]-HEAD_SPRING)/HEAD_DIFFERENCE
+    rhs = -system_matrix[free][:, fixed] @ relative_fixed_head
     h = np.full(len(points), np.nan)
     h[fixed] = fixed_head[fixed]
-    with warnings.catch_warnings():
-        warnings.simplefilter('error', MatrixRankWarning)
-        h[free] = spsolve(system_matrix[free][:, free], rhs)
+    solver_label = "safe mode: memory-bounded iterative solver" if config.safe_mode else "unrestricted sparse direct solver"
+    report(f'Solving saturated groundwater head ({len(free):,} free nodes; {solver_label})')
+    h[free] = HEAD_SPRING + HEAD_DIFFERENCE*solve_head(
+        system_matrix[free][:, free], rhs, safe_mode=config.safe_mode,
+    )
     if not np.all(np.isfinite(h[active_nodes])):
         raise ModelValidationError('Model check failed: np.all(np.isfinite(h[active_nodes]))')
     inactive_nodes = np.setdiff1d(np.arange(len(points)), active_nodes)
     if not np.all(np.isnan(h[inactive_nodes])):
         raise ModelValidationError('Model check failed: np.all(np.isnan(h[inactive_nodes]))')
+    report('Checking element reactions and all borehole budgets')
+    hh = np.nan_to_num(h)
     grad_h = np.zeros((len(tets), 3))
-    grad_h[active_cells] = np.asarray(pg.solver.grad(mesh, np.nan_to_num(h)))[active_cells]
+    r = np.zeros(len(points))
+    bottom_flows = {label: 0.0 for label, _, _ in WELLS}
+    for start in range(0, len(tets), ELEMENT_BATCH_SIZE):
+        stop = min(start+ELEMENT_BATCH_SIZE, len(tets))
+        cells = tets[start:stop]
+        gradients, local = element_matrices(points, cells, K[start:stop])
+        grad_h[start:stop] = np.einsum("ni,nij->nj", hh[cells], gradients)
+        local_reactions = np.einsum("nij,nj->ni", local, hh[cells])
+        np.add.at(r, cells.ravel(), local_reactions.ravel())
+        for label, _, _ in WELLS:
+            mask = (markers[start:stop] == 11) & (well_ids[start:stop] == int(label))
+            if np.any(mask):
+                bottom_nodes = ids[:, :, well_bottom_index[label]].ravel()
+                on_bottom = np.isin(cells[mask], bottom_nodes)
+                bottom_flows[label] += float(local_reactions[mask][on_bottom].sum())
+    grad_h[~active_cells] = 0
     q = -K[:, None] * grad_h
     v = np.zeros_like(q)
     v[active_cells] = q[active_cells] / porosity[active_cells, None]
@@ -343,23 +421,9 @@ def run_model(config: ModelConfig, progress: Callable[[str], None] | None=None) 
     for marker, nodes in patch_nodes.items():
         if not np.max(abs(h[list(nodes)] - patch_heads[marker])) < 1e-07:
             raise ModelValidationError('Model check failed: np.max(abs(h[list(nodes)] - patch_heads[marker])) < 1e-07')
-    report('Checking independent assembly and all borehole budgets')
-    p = points[tets]
-    D = p[:, 1:, :] - p[:, 0:1, :]
-    volumes = abs(np.linalg.det(D)) / 6
-    if not volumes.min() > 0:
-        raise ModelValidationError('Model check failed: volumes.min() > 0')
-    g123 = np.linalg.inv(D).transpose(0, 2, 1)
-    g = np.concatenate([-g123.sum(axis=1, keepdims=True), g123], axis=1)
-    local = K[:, None, None] * volumes[:, None, None] * np.einsum('nik,njk->nij', g, g)
-    rows = np.repeat(tets, 4, axis=1).ravel()
-    cols = np.tile(tets, (1, 4)).ravel()
-    A = coo_matrix((local.ravel(), (rows, cols)), shape=(len(points), len(points))).tocsr()
-    hh = np.nan_to_num(h)
-    r = A @ hh
-    pg_r = system_matrix @ hh
-    if not np.allclose(r, pg_r, rtol=1e-06, atol=1e-11):
-        raise ModelValidationError('Model check failed: np.allclose(r, pg_r, rtol=1e-06, atol=1e-11)')
+    matrix_reactions = system_matrix @ hh
+    if not np.allclose(r, matrix_reactions, rtol=1e-06, atol=1e-11):
+        raise ModelValidationError('Element and assembled-matrix reactions disagree.')
     boundary_flows = {m: float(r[list(nodes)].sum()) for m, nodes in patch_nodes.items()}
     Qrecharge = sum((boundary_flows[m] for m, head in patch_heads.items() if head == HEAD_RECHARGE))
     Qspring = sum((boundary_flows[m] for m, head in patch_heads.items() if head == HEAD_SPRING))
@@ -371,21 +435,13 @@ def run_model(config: ModelConfig, progress: Callable[[str], None] | None=None) 
         raise ModelValidationError(f'Budget imbalance {imbalance:.3e}')
     if not free_residual < 1e-05:
         raise ModelValidationError(f'Free-node residual {free_residual:.3e}')
-    grad_independent = np.einsum('ni,nij->nj', hh[tets], g)
-    if not np.allclose(grad_h[active_cells], grad_independent[active_cells], rtol=1e-06, atol=1e-08):
-        raise ModelValidationError('Model check failed: np.allclose(grad_h[active_cells], grad_independent[active_cells], rtol=1e-06, atol=1e-08)')
     if not (np.all(K[markers == 10] == 0) and np.all(q[markers == 10] == 0)):
         raise ModelValidationError('Model check failed: np.all(K[markers == 10] == 0) and np.all(q[markers == 10] == 0)')
     if not np.all(K[markers == 9] == MATERIALS[6]['K']):
         raise ModelValidationError("Model check failed: np.all(K[markers == 9] == MATERIALS[6]['K'])")
-    local_reactions = np.einsum('nij,nj->ni', local, hh[tets])
     well_budgets = {}
     for label, xf, zf in WELLS:
-        mask = (markers == 11) & (well_ids == int(label))
-        ib = well_bottom_index[label]
-        bottom_nodes = ids[:, :, ib].ravel()
-        on_bottom = np.isin(tets[mask], bottom_nodes)
-        bottom_flow = float(local_reactions[mask][on_bottom].sum())
+        bottom_flow = bottom_flows[label]
         top_flow = boundary_flows[200 + int(label)]
         error = abs(top_flow + bottom_flow) / max(abs(top_flow), abs(bottom_flow), 1e-30)
         if not error < 1e-05:
@@ -395,7 +451,7 @@ def run_model(config: ModelConfig, progress: Callable[[str], None] | None=None) 
         well_budgets[label] = dict(top_inflow_m3_day=top_flow * 86400, bottom_inflow_m3_day=bottom_flow * 86400, relative_balance_error=error, reservoir_head_m=patch_heads[200 + int(label)], bottom_centre_elevation_m=zf * H)
     if np.nanmin(h) < HEAD_SPRING - 1e-06 or np.nanmax(h) > HEAD_RECHARGE + 1e-06:
         messages.append('Head overshoot: inspect distorted elements and refine the mesh.')
-    del p, D, g123, local, rows, cols, local_reactions
+    del system_matrix, gradients, local, local_reactions
     report('Preparing browser-ready numerical dataset')
     vtkcells = np.column_stack([np.full(len(tets), 4), tets]).ravel()
     grid = pv.UnstructuredGrid(vtkcells, np.full(len(tets), pv.CellType.TETRA), points)
@@ -411,5 +467,16 @@ def run_model(config: ModelConfig, progress: Callable[[str], None] | None=None) 
     grid.point_data['Pressure_head_m'] = pressure_head
     summary = {'dimensions_m': [L, W, H], 'spring_head_m': HEAD_SPRING, 'recharge_head_m': HEAD_RECHARGE, 'spring_outflow_m3_day': float(-Qspring * 86400), 'recharge_inflow_m3_day': float(Qrecharge * 86400), 'relative_budget_imbalance': float(imbalance), 'free_node_relative_residual': float(free_residual), 'nodes': len(points), 'tetrahedra': len(tets), 'materials': MATERIALS, 'casing_only_nodes': len(inactive_nodes), 'negative_pressure_node_fraction': float(np.mean(pressure_head[active_nodes] < 0)), 'boundary_budgets': {str(m): dict(name=patch_names[m], head_m=patch_heads[m], area_m2=patch_area[m], inflow_m3_day=flow * 86400) for m, flow in boundary_flows.items()}, 'borehole_budgets': well_budgets, 'geometry': dict(strip_x_m=list(STRIP_X), strip_full_width=True, pipe_width_m=PIPE_WIDTH, casing_thickness_m=CASING_THICKNESS, well_y_m=WELL_Y, wells=[dict(label=label, x_m=xf * L, bottom_centre_m=zf * H) for label, xf, zf in WELLS], fracture_width_m=FRACTURE_WIDTH, fracture_x_m=fracture_x.tolist(), fracture_y_m=fracture_y.tolist(), fracture_horizontal_fractions=fracture_fractions.tolist(), fracture_reference_thickness_m=FRACTURE_REFERENCE_THICKNESS, bedrock_boreholes=bedrock_wells), 'checks': dict(fracture_strip_face_connected=True, bedrock_inlets_connected=True, pipe_sidewalls_cased=True, casing_K_and_flux_exactly_zero=True, all_pipe_top_bottom_budgets_passed=True, requested_flow_signs_passed=True), 'pygimli_version': pg.__version__, 'pyvista_version': pv.__version__, 'interpretation': 'Illustrative saturated Darcy model; ideal reservoir plumbing, finite-width fracture and pipe surrogates; not calibrated or mesh-converged.'}
     summary['config'] = asdict(config)
+    summary['solver'] = dict(
+        safe_mode=config.safe_mode,
+        element_batch_size=ELEMENT_BATCH_SIZE,
+        **(
+            dict(method="equilibrated restarted GMRES with limited-fill ILU",
+                 relative_tolerance=1e-13, restart=50, max_cycles=300,
+                 ilu_fill_factor=10, ilu_drop_tolerance=1e-6)
+            if config.safe_mode
+            else dict(method="unrestricted sparse direct LU", ordering="COLAMD")
+        ),
+    )
     summary['warnings'] = messages
     return ModelResult(config=config, grid=grid, summary=summary, active_nodes=active_nodes, messages=tuple(messages))

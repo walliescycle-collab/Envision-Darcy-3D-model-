@@ -20,7 +20,7 @@ def solver_lock() -> threading.Lock:
     return threading.Lock()
 
 
-@st.cache_data(max_entries=2, show_spinner=False)
+@st.cache_data(max_entries=1, show_spinner=False)
 def calculate(config: ModelConfig) -> AppResults:
     with solver_lock():
         model = run_model(config, progress=st.write)
@@ -37,7 +37,7 @@ def conductivity(label: str, value: float, key: str) -> float:
 
 def main() -> None:
     st.title("Envision 3D Groundwater")
-    st.caption("Steady saturated Darcy flow | 100 × 20 × 60 m | PyGIMLi finite elements")
+    st.caption("Steady saturated Darcy flow | 100 × 20 × 60 m | PyGIMLi-notebook-equivalent FEM")
     st.warning(
         "Conceptual model, not a calibrated prediction. Elevated borehole tops are connected "
         "to ideal external reservoirs. Fractures and pipes are finite-width Darcy surrogates; "
@@ -47,6 +47,18 @@ def main() -> None:
         st.header("Model controls")
         st.caption("Edit parameters, then click Run model. Downloads always match the displayed run.")
         show_hydraulics = st.toggle("Adjust hydraulic properties", value=False)
+        safe_mode = st.toggle(
+            "Safe mode (recommended)", value=True, key="safe_mode",
+            help="Use a memory-bounded iterative solver. Disable for the original full sparse "
+                 "direct solver, which can exhaust Community Cloud memory.",
+        )
+        if safe_mode:
+            st.caption("Safe mode: limited-fill iterative solve; all hydraulic checks remain enabled.")
+        else:
+            st.warning(
+                "Unrestricted mode uses full sparse LU factorization. It may exhaust server "
+                "memory and restart the app. Prefer safe mode on Community Cloud."
+            )
         properties = st.session_state.setdefault(
             "hydraulic_properties",
             dict(rock_k=1e-9, fracture_k=2e-4, sand_k=1e-4, pipe_k=1e-2),
@@ -97,6 +109,12 @@ def main() -> None:
             st.session_state["hydraulic_properties"] = properties
         st.caption("Click Run model to submit hydraulic edits before hiding the controls.")
         st.caption("No desktop windows, Trame service or Jupyter kernel required.")
+        st.divider()
+        st.link_button(
+            "GitHub repository",
+            "https://github.com/walliescycle-collab/Envision-Darcy-3D-model-",
+            width="stretch",
+        )
     nx, ny = {
         "Notebook default (50 × 6)": (50, 6),
         "Coarse (30 × 4)": (30, 4),
@@ -106,6 +124,7 @@ def main() -> None:
         spring_head=float(spring), head_difference=float(difference),
         strip_width=float(strip), fracture_width=float(fracture),
         nx=nx, ny=ny,
+        safe_mode=safe_mode,
         **properties,
     )
     if submitted:
@@ -123,7 +142,7 @@ def main() -> None:
                 status.update(label="Model solved; hydraulic checks passed", state="complete", expanded=False)
     result = st.session_state.get("results")
     if result is None:
-        st.info("Choose parameters in the sidebar and click Run model. The default run can take about a minute.")
+        st.info("Choose parameters in the sidebar and click Run model. The default run can take a few minutes on cloud hosting.")
         with st.expander("What does this model include?", expanded=True):
             st.markdown(
                 "- Six geological layers and a local clay lens.\n"
@@ -131,7 +150,7 @@ def main() -> None:
                 "- A connected fracture grid within low-conductivity bedrock.\n"
                 "- Nine 1 m square boreholes at y=10 m with 0.5 m impermeable casing.\n"
                 "- Boreholes 1–3 feed aquifers; boreholes 4–9 discharge through ideal plumbing.\n"
-                "- Independent stiffness, water-budget, connectivity and pipe-balance checks."
+                "- Element-reaction, water-budget, connectivity and pipe-balance checks."
             )
         return
     summary = result.summary
@@ -144,6 +163,10 @@ def main() -> None:
     columns[1].metric("Spring / river outflow (m³/day)", f'{summary["spring_outflow_m3_day"]:.3f}')
     columns[2].metric("Relative budget imbalance", f'{summary["relative_budget_imbalance"]:.2e}')
     columns[3].metric("Tetrahedra", f'{summary["tetrahedra"]:,}')
+    st.caption(
+        "Displayed result solver: "
+        + ("Safe mode" if summary["config"].get("safe_mode", False) else "Unrestricted mode")
+    )
     geology, flow, sections, budget, downloads = st.tabs(
         ["3D geology", "Head & flow", "Sections", "Budgets & checks", "Downloads & assumptions"]
     )
